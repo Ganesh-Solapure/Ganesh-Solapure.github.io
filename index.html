@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>RPM ↔ Speed Calculator</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
+<!-- Chart.js CDN -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  body { max-width:900px; margin:20px auto; }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  .col { flex:1 1 200px; min-width:180px; }
+  .small { font-size:0.9rem; color:#333; }
+  pre { background:#f6f6f6; padding:10px; border-radius:6px; overflow:auto; }
+  .muted { color:#666; font-size:0.9rem; }
+</style>
+</head>
+<body>
+  <h1>Engine RPM ↔ Speed Calculator</h1>
+  <p class="muted">Drop this file into a GitHub Pages repo (USERNAME.github.io) and you’re live. Save presets locally. Includes tyre-code parsing, plots and a placeholder for live WebSocket data.</p>
+
+  <section>
+    <h3>Inputs</h3>
+    <div class="row">
+      <div class="col">
+        <label>Vehicle speed</label><br>
+        <input id="speed" type="number" value="60" step="0.1"> 
+        <select id="speedUnit"><option value="mph">mph</option><option value="kmh">km/h</option></select>
+      </div>
+
+      <div class="col">
+        <label>Tire diameter (inches)</label><br>
+        <input id="tireIn" type="number" value="23" step="0.01">
+        <div class="small">or enter tyre code (e.g. <code>185/55R15</code>)</div>
+      </div>
+
+      <div class="col">
+        <label>Tyre code</label><br>
+        <input id="tyreCode" placeholder="185/55R15">
+        <button id="parseTyre">Parse</button>
+      </div>
+
+      <div class="col">
+        <label>Transmission ratio</label><br>
+        <input id="ratio" type="number" value="3.99" step="0.001">
+      </div>
+    </div>
+
+    <div style="margin-top:10px" class="row">
+      <button id="calcBtn">Calculate</button>
+      <button id="savePreset">Save preset</button>
+      <select id="presets"></select>
+      <button id="delPreset">Delete preset</button>
+    </div>
+  </section>
+
+  <section>
+    <h3>Results</h3>
+    <pre id="results">Press Calculate</pre>
+  </section>
+
+  <section>
+    <h3>RPM vs Speed (for current tire & ratio)</h3>
+    <canvas id="chart" height="120"></canvas>
+  </section>
+
+  <section>
+    <h3>Live data (placeholder)</h3>
+    <div class="row">
+      <input id="wsUrl" placeholder="wss://your-server-or-proxy/ws" style="width:60%">
+      <button id="connectWs">Connect</button>
+      <div id="wsStatus" class="small muted">Not connected</div>
+    </div>
+    <pre id="liveOut">No live data</pre>
+  </section>
+
+<script>
+/* --- Core formulas --- */
+function tyreDiameterFromCode(code) {
+  // expects strings like 185/55R15 or 205/45R17
+  const m = code.trim().match(/^(\d{3})\/(\d{2})R(\d{2})$/i);
+  if (!m) return null;
+  const width = Number(m[1]); // mm
+  const aspect = Number(m[2]); // %
+  const rim = Number(m[3]); // inches
+  const sidewallIn = (width * (aspect/100)) / 25.4;
+  const diameter = rim + 2*sidewallIn;
+  return diameter;
+}
+
+function wheelsRPM_from_speed(speed, unit, tireDiaIn) {
+  // speed in mph or km/h; convert to mph
+  let speed_mph = speed;
+  if (unit === 'kmh') speed_mph = speed * 0.621371;
+  // formula: wheelsRPM = (speed_mph * 1056) / (π * tire_diameter_in)
+  return (speed_mph * 1056) / (Math.PI * tireDiaIn);
+}
+function engineRPM_from_wheels(wheelsRPM, ratio){ return wheelsRPM * ratio; }
+function speed_from_wheelsRPM(wheelsRPM, tireDiaIn, unit='mph') {
+  // speed_mph = wheelsRPM * (π * tire_diameter) / 1056
+  const speed_mph = wheelsRPM * (Math.PI * tireDiaIn) / 1056;
+  return unit === 'kmh' ? speed_mph / 0.621371 : speed_mph;
+}
+
+/* --- UI wiring --- */
+const out = el('results');
+const chartCtx = document.getElementById('chart').getContext('2d');
+let chart = null;
+
+document.getElementById('parseTyre').addEventListener('click', ()=>{
+  const code = document.getElementById('tyreCode').value;
+  const d = tyreDiameterFromCode(code);
+  if (d === null) alert('Tyre code not recognized. Use format 185/55R15');
+  else document.getElementById('tireIn').value = d.toFixed(2);
+});
+
+document.getElementById('calcBtn').addEventListener('click', doCalc);
+function doCalc(){
+  const speed = Number(document.getElementById('speed').value);
+  const unit = document.getElementById('speedUnit').value;
+  const tire = Number(document.getElementById('tireIn').value);
+  const ratio = Number(document.getElementById('ratio').value);
+  if (!speed || !tire || !ratio) { out.innerText = 'Please enter valid numbers.'; return; }
+
+  const wheelsRPM = wheelsRPM_from_speed(speed, unit, tire);
+  const engineRPM = engineRPM_from_wheels(wheelsRPM, ratio);
+  const wheelRPM_round = wheelsRPM.toFixed(2);
+  const eng_round = engineRPM.toFixed(2);
+
+  out.innerText = `Inputs:
+  Speed: ${speed} ${unit}
+  Tire diameter: ${tire.toFixed(3)} in
+  Transmission ratio: ${ratio}
+
+Results:
+  Wheel RPM: ${wheelRPM_round} rpm
+  Engine RPM: ${eng_round} rpm
+  `;
+
+  plotRPMvsSpeed(tire, ratio, unit);
+}
+
+/* --- Presets: localStorage --- */
+function el(id){ return document.getElementById(id); }
+const PRESETS_KEY = 'rpm_calc_presets_v1';
+function loadPresets(){
+  const raw = localStorage.getItem(PRESETS_KEY);
+  return raw ? JSON.parse(raw) : {};
+}
+function savePresets(obj){ localStorage.setItem(PRESETS_KEY, JSON.stringify(obj)); }
+function refreshPresetList(){
+  const sel = el('presets');
+  sel.innerHTML = '<option value="">-- choose --</option>';
+  const ps = loadPresets();
+  for (const k of Object.keys(ps)) {
+    const o = document.createElement('option'); o.value = k; o.textContent = k;
+    sel.appendChild(o);
+  }
+}
+el('savePreset').addEventListener('click', ()=>{
+  const name = prompt('Preset name? (e.g., MyCar_3rd)');
+  if(!name) return;
+  const ps = loadPresets();
+  ps[name] = {
+    speed: el('speed').value,
+    speedUnit: el('speedUnit').value,
+    tireIn: el('tireIn').value,
+    ratio: el('ratio').value,
+    tyreCode: el('tyreCode').value
+  };
+  savePresets(ps);
+  refreshPresetList();
+});
+el('presets').addEventListener('change', ()=>{
+  const k = el('presets').value;
+  if (!k) return;
+  const ps = loadPresets();
+  const chosen = ps[k];
+  el('speed').value = chosen.speed;
+  el('speedUnit').value = chosen.speedUnit;
+  el('tireIn').value = chosen.tireIn;
+  el('ratio').value = chosen.ratio;
+  el('tyreCode').value = chosen.tyreCode || '';
+  doCalc();
+});
+el('delPreset').addEventListener('click', ()=>{
+  const k = el('presets').value;
+  if (!k) return alert('Choose a preset first');
+  const ps = loadPresets();
+  if (confirm('Delete preset '+k+'?')) { delete ps[k]; savePresets(ps); refreshPresetList(); }
+});
+refreshPresetList();
+
+/* --- Chart: RPM vs speed --- */
+function plotRPMvsSpeed(tire, ratio, unit) {
+  const speeds = [];
+  const engine = [];
+  for (let s=0; s<=140; s+=2) {
+    speeds.push(s);
+    const w = wheelsRPM_from_speed(s, unit, tire);
+    engine.push(engineRPM_from_wheels(w, ratio));
+  }
+  if (chart) chart.destroy();
+  chart = new Chart(chartCtx, {
+    type:'line',
+    data:{ labels:speeds, datasets:[{ label:'Engine RPM', data:engine, fill:false, tension:0.2 }]},
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      scales:{ x:{ title:{ display:true, text:'Speed ('+unit+')' } }, y:{ title:{ display:true, text:'Engine RPM' } } }
+    }
+  });
+}
+
+/* --- WebSocket placeholder for live data --- */
+let ws = null;
+el('connectWs').addEventListener('click', ()=>{
+  const url = el('wsUrl').value.trim();
+  if (!url) return alert('Enter wss:// URL for WebSocket (secure).');
+  if (ws) { ws.close(); ws=null; el('wsStatus').textContent='Disconnected'; return; }
+  try {
+    ws = new WebSocket(url);
+    el('wsStatus').textContent = 'Connecting...';
+    ws.onopen = ()=> el('wsStatus').textContent = 'Connected';
+    ws.onmessage = (ev)=> {
+      // Expecting JSON like {wheel_rpm:123,engine_rpm:456}
+      try {
+        const d = JSON.parse(ev.data);
+        el('liveOut').textContent = JSON.stringify(d, null, 2);
+        // update UI if needed:
+        if (d.wheel_rpm) {
+          out.textContent = `Live wheel rpm: ${d.wheel_rpm}\nLive engine rpm: ${d.engine_rpm || (d.wheel_rpm * Number(el('ratio').value)).toFixed(2)}`;
+        }
+      } catch(e){
+        el('liveOut').textContent = ev.data;
+      }
+    };
+    ws.onerror = (e)=> el('wsStatus').textContent = 'WebSocket error';
+    ws.onclose = ()=> { el('wsStatus').textContent = 'Closed'; ws=null; };
+  } catch(e){
+    alert('WebSocket failed: '+e.message);
+  }
+});
+
+/* init */
+doCalc();
+</script>
+</body>
+</html>
